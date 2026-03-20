@@ -524,6 +524,35 @@ To clean up test uploads from the Receipts tab:
 
 D365 Finance & Operations exposes OData entities for expense management, but they may not be accessible depending on your organization's security configuration.
 
+### JSON Service API (Bearer Token — NOT CURRENTLY USABLE)
+
+D365 also exposes a rich JSON service API at `/api/services` that accepts Entra ID bearer tokens for **discovery** but returns **401** when calling operations. These APIs are well-designed (especially the Copilot-specific ones) but require D365 Service Operation security privileges that are not granted by default.
+
+**How to get a bearer token:**
+```bash
+az account get-access-token --resource https://myexpense.operations.dynamics.com --query accessToken -o tsv
+```
+
+**Discovery works** (HTTP 200):
+- `GET /api/services` — lists 81 service groups
+- `GET /api/services/{group}/{service}/{operation}` — shows parameter names and types
+
+**Key service operations found** (all return 401 when called):
+
+| Service | Operation | Parameters |
+|---------|-----------|------------|
+| `ExpenseReceiptService.UploadReceipt` | Upload receipt as base64 | legalEntity, fileName, capturedReceipt (base64), contentType, fileExtension |
+| `ExpenseReceiptService.GetReceiptContent` | Download receipt | docuRefId (Int64) |
+| `ExpenseReceiptService.AttachReceiptToExpenseLine` | Attach receipt to expense | (unknown — not yet explored) |
+| `ExpenseReportsService.CreateExpenseReport` | Create report | (complex contract) |
+| `ExpenseReportsService.SubmitExpenseReportsToWorkflow` | Submit for approval | (complex contract) |
+| `ExpenseLinesService.CreateExpenseLine` | Add expense line | (complex contract) |
+| `ecpAutomateExpenseReportService.CreateExpenseReport` | Copilot automation | request (ecpExpAutomateCreateReportRequestContract[]) |
+
+**To enable**: A D365 admin must grant Service Operation entry point privileges for these operations to the user or a service principal. Once enabled, the entire expense workflow could be done via curl + bearer token with **no Playwright needed**.
+
+### OData Entities (Also NOT CURRENTLY USABLE)
+
 ### Entities That Exist (Found in `$metadata`)
 
 | Entity | Purpose |
