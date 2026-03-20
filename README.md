@@ -143,9 +143,8 @@ After upload, verify the receipt is valid (not corrupt):
 - ✅ curl returned **HTTP 200** with `[{"fileId":"<guid>"}]`
 - ✅ Receipt appears in the **Receipts tab** with PDF icon
 - ✅ Receipt **persists after page refresh**
+- ✅ **MD5 hash matches** original file (intercept `window.open()` URL → curl download → compare)
 - ⚠️ "Failed to upload" warning banner is expected (from aborted Playwright request) — clears on refresh
-
-> **Note**: Direct download verification is not possible — the `/filemanagement/{fileId}` GET endpoint returns 405 Method Not Allowed.
 
 ### OData API (Not Currently Viable)
 
@@ -171,7 +170,7 @@ For recurring team events, D365 remembers previous guest lists. The skill levera
 | Issue | Workaround |
 |-------|-----------|
 | D365 file upload blocked in browser | Two-phase upload: route interception + curl |
-| Cannot download receipts to verify | Verify via UI: PDF icon, persistence, receipt count |
+| Cannot download receipts to verify | **Fixed**: Intercept `window.open()` URL → curl with cookie-only config → MD5 compare |
 | OData API returns 403 | Security roles required — not granted by default |
 | Bearer token rejected by `/filemanagement` | Cookie auth only — must use Playwright for auth |
 | Access tokens expire quickly | Re-intercept and upload immediately |

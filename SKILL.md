@@ -407,10 +407,58 @@ After uploading a receipt via the two-phase method, verify it's not corrupt:
 4. **Persistence after refresh** — Reload the page (`browser_navigate` back to the workspace). The receipt should still appear with the same count.
 5. **Close the upload dialog first** — D365 auto-detects the server-side upload only after the dialog is closed. The receipt appears in the Receipts tab at that point.
 
-### What You Can't Do
+### Download Verification (MD5 Hash Comparison)
 
-- **Direct download verification** — The `/filemanagement/{fileId}` GET endpoint returns **405 Method Not Allowed**. You cannot download the file via curl to compare MD5 hashes against the original.
-- **Thumbnail URL download** — The thumbnail URL (`filemanagement/_t/{fileId}?access_token=...`) serves a thumbnail image, not the full file.
+You **can** download the uploaded file and verify its integrity via MD5 hash comparison. The key discovery is that the "Open" button uses `window.open()` with a signed URL — intercept that URL, then download with curl.
+
+#### Step 1: Intercept the download URL
+
+```javascript
+async (page) => {
+  await page.evaluate(() => {
+    const origOpen = window.open;
+    window.__capturedOpen = null;
+    window.open = function(...args) {
+      window.__capturedOpen = args[0];
+      return origOpen.apply(this, args);
+    };
+  });
+  await page.getByRole('button', { name: 'Open', exact: true }).click();
+  await page.waitForTimeout(3000);
+  return await page.evaluate(() => window.__capturedOpen);
+}
+```
+
+This returns a relative URL like: `filemanagement/{fileId}?access_token=...&ms-dyn-caid=...&ms-dyn-bsid=...`
+
+#### Step 2: Download via curl with cookie-only config
+
+**Critical**: Use a **cookie-only** curl config (no `url` line). If you reuse the upload config, curl makes two requests and the output gets mixed up.
+
+```python
+# Write download-only config
+with open('/tmp/d365_download.conf', 'w') as f:
+    f.write(f'cookie = "{cookie}"\n')
+```
+
+```bash
+curl -s -o /tmp/verified_receipt.pdf \
+  -K /tmp/d365_download.conf \
+  "https://myexpense.operations.dynamics.com/{captured_url}"
+```
+
+#### Step 3: Compare MD5
+
+```python
+import hashlib
+def md5(path):
+    with open(path, 'rb') as f:
+        return hashlib.md5(f.read()).hexdigest()
+
+assert md5('/tmp/verified_receipt.pdf') == md5('/path/to/original.pdf')
+```
+
+**Tested result**: HTTP 200, exact size match (189,246 bytes), valid PDF header, **MD5 identical** to the original file.
 
 ### Warning Banner After Upload
 
@@ -519,7 +567,7 @@ The OData API requires specific D365 security roles (e.g., read access to `TrvEx
 |-------|-----------|
 | Email attachment download fails | URL-encode the message ID (`/`→`%2F`, `+`→`%2B`, `=`→`%3D`) — see m365-mcp-tools skill |
 | File uploads lose binary content via route interception | Playwright's `postDataBuffer()` drops multipart file content. **Fix: capture form fields via route interception, then upload the actual file via `curl` from bash.** See [Programmatic Receipt Upload](#programmatic-receipt-upload) section. |
-| Cannot download uploaded receipt for verification | `/filemanagement/{fileId}` GET returns 405 Method Not Allowed. Verify via UI checks instead (PDF icon, persistence, receipt count). See [Verifying Uploaded Receipts](#verifying-uploaded-receipts). |
+| Cannot download uploaded receipt for verification | **Fixed**: Intercept `window.open()` URL from the Open button, then `curl` with a cookie-only config (no `url` line). Enables full MD5 hash comparison. See [Download Verification](#download-verification-md5-hash-comparison). |
 | OData API returns 403 | D365 OData entities exist but require security roles not granted by default. See [OData API Status](#odata-api-status). |
 | Bearer token rejected by `/filemanagement` | This endpoint only accepts cookie-based auth. Must use Playwright to obtain cookies. |
 | "Failed to upload" warning banner after two-phase upload | This is from the aborted Playwright upload, not the curl upload. Ignore it — verify receipt in the Receipts tab. Clears on page refresh. |
