@@ -395,6 +395,115 @@ When submitting travel expenses with GBT (or similar travel agency) booking fees
 - ✅ Green checkmark = "This expense does not have any policy violations"
 - ⚠️ Yellow/info icon = "See policy" — click SEE POLICY button to check if blocking or informational
 
+## Verifying Uploaded Receipts
+
+After uploading a receipt via the two-phase method, verify it's not corrupt:
+
+### What to Check
+
+1. **HTTP response** — curl must return HTTP **200** with JSON `[{"fileId":"<guid>"}]`. Any other code means failure.
+2. **Receipt count** — The workspace counter (e.g., "Receipts: 1") should increment after closing the upload dialog.
+3. **Thumbnail image** — In the Receipts tab, the receipt card shows a PDF icon (red Acrobat logo) for valid PDFs. A broken image or generic file icon suggests corruption.
+4. **Persistence after refresh** — Reload the page (`browser_navigate` back to the workspace). The receipt should still appear with the same count.
+5. **Close the upload dialog first** — D365 auto-detects the server-side upload only after the dialog is closed. The receipt appears in the Receipts tab at that point.
+
+### What You Can't Do
+
+- **Direct download verification** — The `/filemanagement/{fileId}` GET endpoint returns **405 Method Not Allowed**. You cannot download the file via curl to compare MD5 hashes against the original.
+- **Thumbnail URL download** — The thumbnail URL (`filemanagement/_t/{fileId}?access_token=...`) serves a thumbnail image, not the full file.
+
+### Warning Banner After Upload
+
+After the route interception aborts the browser-side upload, D365 may show a yellow warning banner: *"[filename] failed to upload. Please try to upload the document again."* This is expected — it refers to the **aborted Playwright upload**, not the curl upload that actually succeeded. The warning clears on page refresh. Verify the receipt is present in the Receipts tab to confirm success.
+
+### Corruption Root Cause (Historical)
+
+Previous corruption occurred when using Playwright's `postDataBuffer()` to forward multipart POST requests — the binary file content was silently dropped, resulting in 0-byte files on the server. D365 would accept these but then reject them when attaching to an expense with "file size is empty". The two-phase approach (intercept fields → curl upload) completely avoids this because curl handles the binary file directly.
+
+## Recalling Submitted Reports
+
+To modify a submitted report (e.g., to change approvers or add expenses), you must first recall it:
+
+1. Go to the **Reports** tab in the Expense Management workspace
+2. Click the report row to select it
+3. Click the **Recall** button in the toolbar
+4. A comment dialog appears — enter a reason (e.g., "Updating interim approvers")
+5. Click **Confirm** / **OK**
+6. Report status changes from "In review" back to "Draft"
+
+**Note**: All approvers lose their assignment when a report is recalled. You'll need to resubmit after making changes.
+
+## Managing Interim Approvers
+
+Interim approvers are optional additional approvers before the final approver. You may need to add or remove them (e.g., when an approver is on leave).
+
+### Removing an Interim Approver
+
+The interim approvers field is **read-only** on the report summary view. To modify it:
+
+1. **Recall** the report first (if status is "In review") — see [Recalling Submitted Reports](#recalling-submitted-reports)
+2. Open the report by clicking the report number
+3. Click **Actions** in the header toolbar
+4. Click **"Edit expense report"** from the dropdown menu
+5. In the Edit dialog, click **"Select interim approvers"** button
+6. A grid shows current interim approvers — select the row to remove
+7. Click **Delete** → confirm **"Yes"** in the confirmation dialog
+8. Click **OK** to close the interim approvers dialog
+9. **D365 quirk — double dialog**: A second "Interim approvers" dialog may appear with an empty row. Just click **OK** again to dismiss it.
+10. Click **OK** on the Edit expense report dialog
+11. **Resubmit** the report — it will now route without the removed approver
+
+### Batch Processing Multiple Reports
+
+If you need to update multiple reports (e.g., removing the same approver from all pending reports):
+
+1. Recall all reports first (they must be in "Draft" status)
+2. Process each one: open → Actions → Edit → Select interim approvers → Delete → OK → OK → OK → Submit
+3. After submitting all reports, verify the workspace shows "Open reports: 0"
+
+## Deleting Test Receipts
+
+To clean up test uploads from the Receipts tab:
+
+1. Go to the **Receipts** tab in the workspace
+2. Click the **checkbox** next to the receipt to select it
+3. Click the **Delete** button in the toolbar
+4. Confirm: **"Are you sure you want to delete the selected items?"** → Click **Yes**
+5. Wait for processing (may show "Please wait" overlay)
+6. Verify the Receipts count returns to 0
+
+## OData API Status
+
+D365 Finance & Operations exposes OData entities for expense management, but they may not be accessible depending on your organization's security configuration.
+
+### Entities That Exist (Found in `$metadata`)
+
+| Entity | Purpose |
+|--------|---------|
+| `Expenses` | Main expenses |
+| `TrvReceipts` | Travel receipts |
+| `UploadReceipts` | Receipt uploads |
+| `ExpenseCategories` | Available categories |
+| `ecpTrvExps` | Expense transactions |
+| `ecpTrvInterimApprovers` | Interim approvers |
+| `MobileExpensesV2` | Mobile expense API |
+
+### Why They Return 403
+
+The OData API requires specific D365 security roles (e.g., read access to `TrvExpTransEntity`) that are separate from UI access. Error: *"User is not authorized to read view TrvExpTransEntity. Request denied."*
+
+**To enable**: A D365 admin must assign the user the appropriate data entity security roles (e.g., `TrvExpenseTransEntity` read/write privileges).
+
+### Bearer Token vs Cookie Auth
+
+| Endpoint | Bearer Token (`az account get-access-token`) | Cookie Auth (Playwright) |
+|----------|----------------------------------------------|--------------------------|
+| `/data/*` (OData) | 403 (security role needed) | N/A |
+| `/filemanagement` (uploads) | Returns login page (rejected) | ✅ Works |
+| D365 UI pages | N/A | ✅ Works |
+
+**Bottom line**: Until OData security roles are granted, Playwright + curl is the only working upload method. The bearer token approach (`az account get-access-token --resource https://myexpense.operations.dynamics.com`) gets a valid token, but the endpoints either require OData roles or don't accept bearer auth.
+
 ## Submitting the Report
 
 1. Open the report → verify all expenses show green policy compliant icons
@@ -410,12 +519,53 @@ When submitting travel expenses with GBT (or similar travel agency) booking fees
 |-------|-----------|
 | Email attachment download fails | URL-encode the message ID (`/`→`%2F`, `+`→`%2B`, `=`→`%3D`) — see m365-mcp-tools skill |
 | File uploads lose binary content via route interception | Playwright's `postDataBuffer()` drops multipart file content. **Fix: capture form fields via route interception, then upload the actual file via `curl` from bash.** See [Programmatic Receipt Upload](#programmatic-receipt-upload) section. |
+| Cannot download uploaded receipt for verification | `/filemanagement/{fileId}` GET returns 405 Method Not Allowed. Verify via UI checks instead (PDF icon, persistence, receipt count). See [Verifying Uploaded Receipts](#verifying-uploaded-receipts). |
+| OData API returns 403 | D365 OData entities exist but require security roles not granted by default. See [OData API Status](#odata-api-status). |
+| Bearer token rejected by `/filemanagement` | This endpoint only accepts cookie-based auth. Must use Playwright to obtain cookies. |
+| "Failed to upload" warning banner after two-phase upload | This is from the aborted Playwright upload, not the curl upload. Ignore it — verify receipt in the Receipts tab. Clears on page refresh. |
 | Grid row CSS IDs are unstable | Use `aria-label` selectors, not CSS IDs |
 | Virtualized grids render few rows | Scroll with `mouse.wheel()` via `browser_run_code` |
 | Em-dash in category names | Filter by partial name + select from dropdown |
 | Multiple "Close" buttons on page | Scope to dialog: `page.getByLabel('Dialog Name').getByRole('button', { name: 'Close' })` |
 | Edit expense Close sometimes navigates away | Use `force: true`, verify page title after click |
 | Hotel category requires itemisation | Use Airfare with Service class "Other charges" for simple fees |
+| Interim approvers field is read-only on report view | Must use Actions → Edit expense report → Select interim approvers workflow |
+| D365 pages load slowly | Add `waitForTimeout(3000-5000)` after navigation. Console SSL errors (`ERR_SSL_UNRECOGNIZED_NAME_ALERT`) are normal and don't affect functionality. |
+| "Please wait" overlay blocks interactions | Wait for the overlay to disappear before clicking. Use `browser_wait_for` with appropriate time. |
+| MCP server auth tokens expire | M365 MCP tools (Mail, Calendar, Teams) use OAuth tokens that expire. Check with health check scripts and re-authenticate with `/mcp` command when needed. |
+| Teams MCP scope errors | `TeamsServer` may return AADSTS9010010 scope errors. Workaround: use Playwright to navigate to `teams.cloud.microsoft` and interact via browser automation. |
+
+## Environment & Platform Notes
+
+### Running from Linux / CDE / WSL
+
+This skill is designed to run from a Linux environment (Cloud Development Environment, WSL, or native Linux) with:
+
+- **Playwright MCP server** controlling a Chromium-based browser (typically Edge)
+- **bash / curl / python3** available for the two-phase upload
+- **az cli** authenticated for `az account get-access-token` (useful for future OData access)
+
+### Browser Session Management
+
+- D365 uses cookie-based authentication with chunked cookies (`DynamicsOwinAuthC1`, `DynamicsOwinAuthC2`) that can be 4000+ characters total
+- Browser sessions are maintained by Playwright — if the session expires, navigate back to the D365 URL and it will re-authenticate via SSO
+- The CSRF token, bsid, and access tokens are session-scoped and expire quickly — always capture fresh tokens immediately before each upload
+
+### Multi-Company Support
+
+D365 instances can host multiple companies (legal entities). The company code appears in the URL (`?cmp=XXXX`) and the nav bar shows the current company name. To switch:
+
+1. Click the company button in the nav bar (e.g., "Current company is 1074")
+2. Change the **"Current company"** combobox
+3. The workspace refreshes with that company's data
+
+**Important**: Expense reports, cost centers, and approvers are company-specific. Verify you're in the correct company before creating reports.
+
+### Personal Card vs Corporate Card Expenses
+
+- **Corporate card** charges (e.g., CC_Amex) auto-import into D365 as open expenses — reconcile these, don't duplicate them
+- **Personal card** expenses require manual cash expense creation and result in reimbursement to the employee
+- Keep corporate card and personal card expenses in **separate reports** — they have different payment processing workflows
 
 ## Tips
 
@@ -425,3 +575,6 @@ When submitting travel expenses with GBT (or similar travel agency) booking fees
 - **Corporate card expenses** (e.g., CC_Amex) may auto-appear as open expenses — only add relevant ones to your report
 - **Country/region triggers tax recalculation** — amounts in the grid change after setting it
 - **Receipt thumbnails** in the "Select existing" tab help identify the right file visually
+- **Upload immediately after intercepting** — Access tokens in the captured form fields expire quickly. Don't delay between Phase 1 (interception) and Phase 2 (curl upload).
+- **Verify receipt after every upload** — Close the upload dialog, check the Receipts count incremented, and confirm the PDF icon appears. Don't assume success from the curl HTTP 200 alone.
+- **Keep temp files tidy** — Clean up `/tmp/d365_upload.conf` and downloaded receipts after each session to avoid stale tokens being reused

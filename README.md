@@ -131,10 +131,32 @@ For M365 MCP server setup, see [skill-m365-mcp-tools](https://github.com/danielp
 
 D365 blocks direct browser file uploads with `ERR_ACCESS_DENIED`. This skill uses a proven workaround:
 
-1. **Phase 1** — Playwright route interception captures dynamic form fields (CSRF token, session ID, access token, record IDs) when the Upload button is clicked
+1. **Phase 1** — Playwright route interception captures dynamic form fields (CSRF token, session ID, access token, record IDs) when the Upload button is clicked, then **aborts** the browser request
 2. **Phase 2** — `curl` POSTs the actual file with captured fields from bash, bypassing the browser restriction
 
-> The 4000+ character D365 auth cookie is written to a curl config file via Python to avoid shell truncation.
+> **Critical**: The 4000+ character D365 auth cookie must be written to a curl config file via Python — shell variables silently truncate it, causing HTTP 302 redirects.
+
+### Upload Verification
+
+After upload, verify the receipt is valid (not corrupt):
+
+- ✅ curl returned **HTTP 200** with `[{"fileId":"<guid>"}]`
+- ✅ Receipt appears in the **Receipts tab** with PDF icon
+- ✅ Receipt **persists after page refresh**
+- ⚠️ "Failed to upload" warning banner is expected (from aborted Playwright request) — clears on refresh
+
+> **Note**: Direct download verification is not possible — the `/filemanagement/{fileId}` GET endpoint returns 405 Method Not Allowed.
+
+### OData API (Not Currently Viable)
+
+D365 exposes OData entities (`Expenses`, `TrvReceipts`, `UploadReceipts`, etc.) but they return **403 Forbidden** without specific security roles. The `/filemanagement` upload endpoint only accepts **cookie-based auth** (not bearer tokens). A D365 admin would need to grant OData data entity privileges for API-only access to work.
+
+### Report Management
+
+The skill also handles:
+- **Recalling submitted reports** — pull "In review" reports back to "Draft" for editing
+- **Managing interim approvers** — add/remove via Actions → Edit expense report → Select interim approvers
+- **Batch operations** — recall and resubmit multiple reports (e.g., removing an approver who is on leave)
 
 ### Corporate Card Reconciliation
 
@@ -149,11 +171,15 @@ For recurring team events, D365 remembers previous guest lists. The skill levera
 | Issue | Workaround |
 |-------|-----------|
 | D365 file upload blocked in browser | Two-phase upload: route interception + curl |
+| Cannot download receipts to verify | Verify via UI: PDF icon, persistence, receipt count |
+| OData API returns 403 | Security roles required — not granted by default |
+| Bearer token rejected by `/filemanagement` | Cookie auth only — must use Playwright for auth |
 | Access tokens expire quickly | Re-intercept and upload immediately |
 | Cookie too long for shell variables | Write to curl config file via Python |
 | Virtualized category dropdowns | Scroll with `mouse.wheel()` via `browser_run_code` |
-| Em-dash in category names | Filter by partial name + dropdown selection |
 | Multiple Close buttons on page | Scope to dialog: `page.getByLabel('Dialog Name').getByRole(...)` |
+| Teams MCP may have scope errors | Fall back to Playwright browser automation on `teams.cloud.microsoft` |
+| MCP auth tokens expire | Re-authenticate with `/mcp` command; check with health scripts |
 
 ## License
 
