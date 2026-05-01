@@ -6,15 +6,29 @@ license: MIT
 
 # Dynamics 365 Expense Management
 
+This skill drives the D365 F&O Expense Management web UI via Playwright. The base URL pattern is `https://<tenant>expense.operations.dynamics.com` (Microsoft tenants use `myexpense`, others use their own subdomain). Most of this guidance is tenant-agnostic; tenant-specific items (like the receipt-by-email address) are called out where they appear.
+
 ## Getting Started
 
 ### Step 1: Navigate to the base URL
 
+Ask the user for their D365 expense URL if you don't already know it (or check their browser bookmarks / past sessions). Then:
+
 ```
-browser_navigate → https://myexpense.operations.dynamics.com
+browser_navigate → https://<tenant>expense.operations.dynamics.com
 ```
 
 The system auto-redirects to `?cmp=XXXX&mi=DefaultDashboard` using the logged-in user's default company. No need to hardcode company codes.
+
+### 💡 Shortcut: Email receipts directly
+
+D365 supports forwarding receipts by email — they auto-arrive on the user's Receipts tab without any upload work. **Look for an info banner on the workspace** that gives the org-specific address (e.g. `ExpenseReceipts@<tenant>.com` for Microsoft, or similar for other tenants).
+
+When this banner is present, **suggest this path first** before doing any programmatic upload:
+
+> "I see your D365 supports emailing receipts to `<address>`. If you forward your PDFs there from your work account, they'll show up automatically — much faster than me uploading them via the API. Want to try that, or should I upload directly?"
+
+Caveat: this feature has to be enabled by the tenant admin and requires emails to come from the user's authenticated work account. If it's not configured or doesn't work, fall back to the [programmatic upload](#programmatic-receipt-upload) below.
 
 ### Step 2: Discover Environment Details
 
@@ -202,97 +216,116 @@ Encoded for tools: AQMkADBh...AADt%2F00xOu0ekm1rgcnW%2F5MQwcA...HwS%2ByVwAA...YQ
 
 ### Programmatic Receipt Upload
 
-D365's `/filemanagement` endpoint blocks direct browser uploads with `ERR_ACCESS_DENIED`. The working approach is a **two-phase upload**: use Playwright route interception to capture the dynamic form fields D365 generates, then use `curl` from bash to POST the actual file with those fields.
+> Before doing this, check whether the workspace shows an info banner about emailing receipts to a specific address. If yes, recommend that path first (see [Email receipts directly](#-shortcut-email-receipts-directly)) — it's far simpler.
 
-> **Why route interception alone doesn't work**: Playwright's `request.postDataBuffer()` does NOT capture binary file content in multipart form data — the file part arrives empty (0 bytes). D365 accepts the upload but stores an empty file, then rejects it on attach with "file size is empty".
+D365's `/filemanagement` endpoint blocks direct browser uploads with `ERR_ACCESS_DENIED` from Playwright. The working approach is **capture tokens → curl-upload binary**.
+
+Three things to get right (in priority order):
+
+1. **Fresh BSID** — `ms-dyn-bsid` (Browser Session ID) changes on every `page.goto()`. Capture tokens from the *current* page session immediately before uploading. Stale BSID = HTTP 200 returned but file stored as 0 bytes (silent corruption).
+2. **Cookie filtered to operations.dynamics.com only** — Including cookies from other dynamics.com subdomains (e.g. `CrmOwinAuth` from `.crm.dynamics.com`) causes HTTP 302 redirect to login. Only `ms-dyn-affinity`, `backend-affinity`, `DynamicsOwinAuth`, `ms-dyn-csrftoken`, `DynamicsOwinAuthC1`, `DynamicsOwinAuthC2` should be sent.
+3. **Browse → file chooser → `browser_file_upload`** — Never use `page.locator('input[type="file"]').setInputFiles()` directly; it crashes the D365 page.
 
 #### Step 1: Open the upload dialog and select the file
 
-Use individual Playwright tool calls (NOT `browser_run_code` — you need the file chooser modal):
-
 1. Click the **Receipts** tab on the expense report
 2. Click **Add receipts** → the Receipts dialog opens with "Add new" tab
-3. Click **Browse** → triggers a file chooser modal
-4. Use `browser_file_upload` with `paths: ["/path/to/receipt.pdf"]`
-5. Verify the filename appears in the "File to upload" textbox and the **Upload** button is enabled
-
-#### Step 2: Intercept form fields (browser_run_code)
-
-Install a route interceptor, click Upload, capture the dynamic fields, then abort the request so `curl` can send the real one:
+3. Set up the file chooser handler **before** clicking Browse, then select the file:
 
 ```javascript
 async (page) => {
-  let capturedData = null;
+  const filePromise = page.waitForEvent('filechooser', { timeout: 10000 });
+  await page.getByRole('button', { name: 'Browse' }).click({ force: true });
+  const fc = await filePromise;
+  await fc.setFiles(['/path/to/receipt.pdf']);
+  await page.waitForTimeout(1500);
+  // Verify
+  const fileTb = await page.getByRole('textbox', { name: 'File to upload' }).inputValue();
+  return fileTb;  // Should be 'receipt.pdf'
+}
+```
 
+> **Common gotcha**: a stale `page.once('filechooser', ...)` handler from an earlier failed attempt can intercept the chooser and clear it. Reset with `page.removeAllListeners('filechooser')` if Browse stops opening a chooser.
+
+#### Step 2: Intercept tokens and abort the browser-side upload
+
+```javascript
+async (page) => {
+  let captured = null;
   await page.route('**/filemanagement', async (route) => {
-    const request = route.request();
-    if (request.method() === 'POST') {
-      const postData = request.postData();
-      const headers = request.headers();
-
+    if (route.request().method() === 'POST') {
+      const headers = route.request().headers();
       const fields = {};
-      const fieldRegex = /name="([^"]+)"\r\n\r\n([^\r]*)/g;
-      let match;
-      while ((match = fieldRegex.exec(postData)) !== null) {
-        if (match[1] !== 'files[]') {
-          fields[match[1]] = match[2];
-        }
+      const re = /name="([^"]+)"\r\n\r\n([^\r]*)/g;
+      let m;
+      while ((m = re.exec(route.request().postData())) !== null) {
+        if (m[1] !== 'files[]') fields[m[1]] = m[2];
       }
-
-      capturedData = {
-        csrfToken: headers['ms-dyn-csrftoken'],
+      captured = {
         bsid: headers['ms-dyn-bsid'],
-        cookie: headers['cookie'],
-        fields: fields
+        csrfToken: headers['ms-dyn-csrftoken'],
+        fields
       };
-
+      await page.evaluate((d) => { window.__capturedUpload = d; }, captured);
       await route.abort();
     } else {
       await route.continue();
     }
   });
-
+  page.once('filechooser', async (fc) => { await fc.setFiles([]); });
   await page.getByRole('button', { name: 'Upload' }).click();
   await page.waitForTimeout(3000);
   await page.unroute('**/filemanagement');
-
-  return JSON.stringify(capturedData, null, 2);
+  return captured ? { bsid: captured.bsid, clientId: captured.fields.clientId } : 'NO CAPTURE';
 }
 ```
 
-The returned JSON contains:
-- `csrfToken`, `bsid`, `cookie` — authentication headers
-- `fields.clientId` — session-specific upload client ID
-- `fields.accesstoken` — time-limited upload authorization token
-- `fields.tableid`, `fields.recid`, `fields.companyid` — record identifiers
-- `fields.docuname`, `fields.docutypeid` — document metadata
+The captured `fields` object contains `clientId`, `tableid`, `recid`, `companyid`, `accesstoken`, `docuname`, `docutypeid` — needed for curl.
 
-#### Step 3: Upload via curl
+#### Step 3: Dump cookies via storageState (cleanest method)
 
-> **CRITICAL: Cookie handling** — The captured `cookie` string is 4000+ characters (D365 auth uses chunked cookies: `DynamicsOwinAuthC1`, `DynamicsOwinAuthC2`). Shell variables will silently truncate it, causing HTTP 302 redirects. **Always write the cookie to a curl config file** using Python:
+Don't try to parse cookies out of the captured request — use Playwright's `storageState`, which writes them to disk in JSON form:
 
-```python
-# Write curl config file with the full cookie (avoids shell truncation)
-python3 -c "
-cookie = '''<paste full cookie string from captured JSON>'''
-csrf = '<csrfToken value>'
-bsid = '<bsid value>'
-with open('/tmp/d365_upload.conf', 'w') as f:
-    f.write(f'url = \"https://myexpense.operations.dynamics.com/filemanagement\"\n')
-    f.write(f'header = \"Accept: application/json, text/javascript, */*; q=0.01\"\n')
-    f.write(f'header = \"X-Requested-With: XMLHttpRequest\"\n')
-    f.write(f'header = \"ms-dyn-bsid: {bsid}\"\n')
-    f.write(f'header = \"ms-dyn-csrftoken: {csrf}\"\n')
-    f.write(f'cookie = \"{cookie}\"\n')
-"
+```javascript
+async (page) => {
+  await page.context().storageState({ path: '/tmp/d365_storage.json' });
+  return 'wrote storage state';
+}
 ```
 
-Then upload:
+#### Step 4: Build curl config (filter to operations.dynamics.com)
+
+```python
+import json
+with open('/tmp/d365_storage.json') as f:
+    state = json.load(f)
+with open('/tmp/captured_tokens.json') as f:  # write this file via browser_evaluate from window.__capturedUpload
+    tk = json.load(f)
+
+# CRITICAL: filter cookies to operations.dynamics.com only.
+# Including .crm.dynamics.com cookies causes HTTP 302 redirect.
+ops_cookies = [c for c in state['cookies'] if 'operations.dynamics.com' in c.get('domain', '')]
+cookie_str = '; '.join(f"{c['name']}={c['value']}" for c in ops_cookies)
+
+with open('/tmp/d365_upload.conf', 'w') as f:
+    f.write('header = "Accept: application/json, text/javascript, */*; q=0.01"\n')
+    f.write('header = "X-Requested-With: XMLHttpRequest"\n')
+    f.write(f'header = "ms-dyn-bsid: {tk["bsid"]}"\n')
+    f.write(f'header = "ms-dyn-csrftoken: {tk["csrfToken"]}"\n')  # keep URL-encoded
+    f.write(f'cookie = "{cookie_str}"\n')
+
+# Cookie-only config for downloads (verification)
+with open('/tmp/d365_download.conf', 'w') as f:
+    f.write(f'cookie = "{cookie_str}"\n')
+```
+
+#### Step 5: Upload via curl (batch any number of files)
 
 ```bash
 curl -s -o /tmp/upload_response.txt -w "%{http_code}" \
   -K /tmp/d365_upload.conf \
   -X POST \
+  "https://<tenant>expense.operations.dynamics.com/filemanagement" \
   -F "clientId=${CLIENT_ID}" \
   -F "maxChunkSize=1024000" \
   -F "tableid=${TABLE_ID}" \
@@ -308,26 +341,130 @@ curl -s -o /tmp/upload_response.txt -w "%{http_code}" \
 ```
 
 **Expected results:**
-- ✅ HTTP **200** with JSON `[{"fileId":"<guid>"}]` — upload succeeded
-- ❌ HTTP **302** — cookie was truncated; rewrite using the config file approach
-- ❌ HTTP **401/403** — token expired; re-run Step 2 to get fresh tokens
+- ✅ HTTP **200** with JSON `[{"fileId":"<guid>"}]` — file uploaded successfully
+- ❌ HTTP **302** → cookies aren't filtered correctly, or wrong domain cookies included
+- ❌ HTTP **401/403** → access token expired (re-capture)
+- ⚠️ HTTP **200** but file is 0-byte when attaching → **stale BSID** (re-capture from current session)
 
-#### Step 4: Close dialog and verify
+Same tokens can upload many files — you don't need to re-capture between files in a batch.
 
-1. Click **Close** on the Receipts upload dialog
-2. D365 auto-detects the server-side upload — the receipt appears in the Receipts tab
-3. Verify the Receipts count incremented (e.g., "Receipts: 1")
+#### Step 6: Close the upload dialog
 
-#### Step 5: Attach receipt to expense
+After all curl uploads succeed, close the Receipts upload dialog. D365's Receipts tab will populate automatically with the uploaded files (this is the BSID-fresh case — no `route.fulfill` dance needed).
 
-See [Attaching Uploaded Receipts to Individual Expenses](#attaching-uploaded-receipts-to-individual-expenses) below. Alternatively, from the Receipts tab, select the receipt checkbox and click **Attach to expense**, then click the add icon on the target expense row.
+```javascript
+await page.locator('button[id*="CloseButtonAddNewTabPage"]').first().click();
+await page.waitForTimeout(2000);
+```
 
-**What does NOT work** (tested and failed):
-- **Playwright route interception** (`page.request.fetch(request)`, `route.fetch()`) → multipart binary content is lost, file stored as 0 bytes
-- **`page.evaluate` + `fetch()`** from browser context → can't access local files
-- **`page.setInputFiles()`** without the Browse→file chooser flow → D365 page crash
-- **JS `DataTransfer` API** → D365 ignores synthetic events (`isTrusted: false`)
-- **Direct OData API** (`/data/DocumentAttachments`) → 404/403, not exposed on this instance
+Verify: the Receipts count should reflect the new uploads, and each file appears in the receipts list.
+
+#### When `route.fulfill` IS needed
+
+Historically, file size metadata was recorded as 0 bytes when the client-side upload callback didn't fire. The fix was to re-do the upload flow with `route.fulfill()` returning the curl's fileId. **In practice, with a fresh BSID matching the page session, this isn't needed** — D365 auto-detects the server-side files correctly.
+
+If you do see 0-byte file errors after attaching, redo the upload for the affected file(s) using `route.fulfill`:
+
+```javascript
+async (page, fileId, filePath) => {
+  // Re-open Receipts dialog → Browse → setFiles(filePath)
+  // ... then:
+  await page.route('**/filemanagement', async (route) => {
+    if (route.request().method() === 'POST') {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify([{ fileId }])
+      });
+    } else { await route.continue(); }
+  });
+  page.once('filechooser', async (fc) => { await fc.setFiles([]); });
+  await page.getByRole('button', { name: 'Upload' }).click();
+  await page.waitForTimeout(3500);
+  await page.unroute('**/filemanagement');
+}
+```
+
+#### Optional: Verify upload integrity (MD5)
+
+To confirm the file binary is intact, intercept the receipt's download URL via `window.open`, curl it back with the cookie-only config, and compare MD5 hashes:
+
+```javascript
+async (page) => {
+  await page.evaluate(() => {
+    const orig = window.open;
+    window.__capturedOpen = null;
+    window.open = function(...args) { window.__capturedOpen = args[0]; return orig.apply(this, args); };
+  });
+  await page.getByRole('button', { name: 'Open', exact: true }).click();
+  await page.waitForTimeout(2000);
+  return await page.evaluate(() => window.__capturedOpen);
+}
+```
+
+```bash
+curl -s -o /tmp/verified.pdf -K /tmp/d365_download.conf \
+  "https://<tenant>expense.operations.dynamics.com/<captured_url>"
+md5sum /path/to/original.pdf /tmp/verified.pdf
+```
+
+#### What does NOT work
+
+- **Playwright route fetch + forward** — `postDataBuffer()` drops multipart binary content; file ends up 0-byte
+- **Browser-context `fetch()`** — can't access local files
+- **`page.setInputFiles()`** without the Browse → chooser flow — crashes the D365 page
+- **JS `DataTransfer` API for file injection** — D365 ignores synthetic events (`isTrusted: false`)
+- **Bearer token (`az account get-access-token`) on `/filemanagement`** — endpoint only accepts cookie-based auth
+
+### Attaching Receipts to Expenses
+
+From the **Receipts tab**, select a receipt checkbox and click **Attach to expense**, then click the add icon on the matching expense row in the dialog.
+
+> **CRITICAL: Checkbox selection requires disabling overlay.** D365's receipt card layout has a `File name` textbox that overlaps the checkbox. Playwright's click lands on the textbox or refuses entirely. Disable pointer-events on the overlapping elements, click, then restore:
+
+```javascript
+async (page, receiptName) => {
+  // Disable overlapping elements
+  await page.evaluate(() => {
+    document.querySelectorAll('input[aria-label="File name"], .dyn-container._1fifp8f').forEach(el => {
+      el.style.pointerEvents = 'none';
+    });
+  });
+  // Click checkbox — this now triggers D365's Knockout bindings properly
+  await page.getByRole('checkbox', { name: new RegExp('Select or unselect ' + receiptName) }).click({ timeout: 5000 });
+  // Restore
+  await page.evaluate(() => {
+    document.querySelectorAll('input[aria-label="File name"], .dyn-container._1fifp8f').forEach(el => {
+      el.style.pointerEvents = '';
+    });
+  });
+}
+```
+
+Then click **Attach to expense** → in the dialog, click the `addButtonImageProvider` icon on the matching expense row:
+
+```javascript
+await page.getByRole('button', { name: ' Attach to expense' }).click();
+await page.waitForTimeout(2000);
+await page.getByRole('row', { name: /addButtonImageProvider 3\/12\// }).getByLabel('addButtonImageProvider').click();
+await page.waitForTimeout(2500);
+await page.keyboard.press('Escape');  // close the dialog
+```
+
+> **The dialog grid is virtualized** — only ~6 rows visible at a time. For expenses further down, press `PageDown` to scroll before clicking the add icon.
+
+> **WARNING: Don't "attach to first available" in a loop.** Always match receipt to the correct expense by amount/date. If the matching expense isn't in the dialog grid, scroll first.
+
+> **Multi-checkbox state**: Selecting a new receipt doesn't automatically deselect a previously checked one. To attach receipts one-by-one, uncheck previously checked rows before each attach. Easy pattern:
+> ```javascript
+> const checked = await page.locator('input[type="checkbox"][role="checkbox"][aria-checked="true"]').all();
+> for (const cb of checked) {
+>   const lbl = await cb.getAttribute('aria-label') || '';
+>   if (lbl.startsWith('Select or unselect ') && lbl.includes('Document value')) {
+>     await cb.click({ force: true }).catch(() => {});
+>   }
+> }
+> ```
 
 **Finding receipt files on disk**: Check `~/Downloads/`, `/mnt/c/Users/<username>/Downloads/`, or use `glob`/`ls` to search for `*receipt*`, `*invoice*`, `*.pdf`.
 
@@ -355,8 +492,19 @@ Once receipts are uploaded to the report, attach them to each expense:
 2. In the detail panel, find **Receipts** section → click **Edit** link
 3. Click **Add receipts**
 4. Switch to **Select existing** tab
-5. Check the checkbox next to the correct receipt — **use `force: true` click** (a textbox element overlays the checkbox and intercepts pointer events)
-6. Click **Add**
+5. Check the checkbox next to the correct receipt — **disable overlapping elements first** (a textbox element overlays the checkbox and intercepts pointer events):
+   ```javascript
+   await page.evaluate(() => {
+     document.querySelectorAll('input[aria-label="File name"], .dyn-container._1fifp8f')
+       .forEach(el => { el.style.pointerEvents = 'none'; });
+   });
+   await page.getByRole('checkbox', { name: /receipt_name/ }).click({ timeout: 5000 });
+   await page.evaluate(() => {
+     document.querySelectorAll('input[aria-label="File name"], .dyn-container._1fifp8f')
+       .forEach(el => { el.style.pointerEvents = ''; });
+   });
+   ```
+6. Click **Add** — this is the critical step! Without clicking Add, the selection is lost on Close
 7. Click **Close** — **scope to the dialog**: `page.getByLabel('Edit receipts').getByRole('button', { name: 'Close' })` to avoid strict mode violations from multiple Close buttons on the page
 
 ## Changing Expense Categories
@@ -397,76 +545,28 @@ When submitting travel expenses with GBT (or similar travel agency) booking fees
 
 ## Verifying Uploaded Receipts
 
-After uploading a receipt via the two-phase method, verify it's not corrupt:
+After uploading via curl, quick checks:
 
-### What to Check
+1. **HTTP response** — curl must return HTTP **200** with JSON `[{"fileId":"<guid>"}]`. Any other code means failure (see [error map](#step-5-upload-via-curl-batch-any-number-of-files)).
+2. **Receipt count** — The workspace counter increments after closing the upload dialog.
+3. **Thumbnail image** — In the Receipts tab, the receipt card shows a PDF icon. A broken image suggests corruption.
+4. **Persistence after refresh** — Reload the page; receipt should still appear.
 
-1. **HTTP response** — curl must return HTTP **200** with JSON `[{"fileId":"<guid>"}]`. Any other code means failure.
-2. **Receipt count** — The workspace counter (e.g., "Receipts: 1") should increment after closing the upload dialog.
-3. **Thumbnail image** — In the Receipts tab, the receipt card shows a PDF icon (red Acrobat logo) for valid PDFs. A broken image or generic file icon suggests corruption.
-4. **Persistence after refresh** — Reload the page (`browser_navigate` back to the workspace). The receipt should still appear with the same count.
-5. **Close the upload dialog first** — D365 auto-detects the server-side upload only after the dialog is closed. The receipt appears in the Receipts tab at that point.
-
-### Download Verification (MD5 Hash Comparison)
-
-You **can** download the uploaded file and verify its integrity via MD5 hash comparison. The key discovery is that the "Open" button uses `window.open()` with a signed URL — intercept that URL, then download with curl.
-
-#### Step 1: Intercept the download URL
-
-```javascript
-async (page) => {
-  await page.evaluate(() => {
-    const origOpen = window.open;
-    window.__capturedOpen = null;
-    window.open = function(...args) {
-      window.__capturedOpen = args[0];
-      return origOpen.apply(this, args);
-    };
-  });
-  await page.getByRole('button', { name: 'Open', exact: true }).click();
-  await page.waitForTimeout(3000);
-  return await page.evaluate(() => window.__capturedOpen);
-}
-```
-
-This returns a relative URL like: `filemanagement/{fileId}?access_token=...&ms-dyn-caid=...&ms-dyn-bsid=...`
-
-#### Step 2: Download via curl with cookie-only config
-
-**Critical**: Use a **cookie-only** curl config (no `url` line). If you reuse the upload config, curl makes two requests and the output gets mixed up.
-
-```python
-# Write download-only config
-with open('/tmp/d365_download.conf', 'w') as f:
-    f.write(f'cookie = "{cookie}"\n')
-```
-
-```bash
-curl -s -o /tmp/verified_receipt.pdf \
-  -K /tmp/d365_download.conf \
-  "https://myexpense.operations.dynamics.com/{captured_url}"
-```
-
-#### Step 3: Compare MD5
-
-```python
-import hashlib
-def md5(path):
-    with open(path, 'rb') as f:
-        return hashlib.md5(f.read()).hexdigest()
-
-assert md5('/tmp/verified_receipt.pdf') == md5('/path/to/original.pdf')
-```
-
-**Tested result**: HTTP 200, exact size match (189,246 bytes), valid PDF header, **MD5 identical** to the original file.
+Optional: full MD5 hash verification — see [Optional: Verify upload integrity (MD5)](#optional-verify-upload-integrity-md5) above.
 
 ### Warning Banner After Upload
 
-After the route interception aborts the browser-side upload, D365 may show a yellow warning banner: *"[filename] failed to upload. Please try to upload the document again."* This is expected — it refers to the **aborted Playwright upload**, not the curl upload that actually succeeded. The warning clears on page refresh. Verify the receipt is present in the Receipts tab to confirm success.
+After route interception aborts the browser-side upload, D365 may show a yellow warning banner: *"[filename] failed to upload. Please try to upload the document again."* This is expected — it refers to the **aborted Playwright upload**, not the curl upload. The warning clears on page refresh. Verify the receipt is present in the Receipts tab to confirm success.
 
-### Corruption Root Cause (Historical)
+### Corruption Root Causes (for reference)
 
-Previous corruption occurred when using Playwright's `postDataBuffer()` to forward multipart POST requests — the binary file content was silently dropped, resulting in 0-byte files on the server. D365 would accept these but then reject them when attaching to an expense with "file size is empty". The two-phase approach (intercept fields → curl upload) completely avoids this because curl handles the binary file directly.
+If you hit upload corruption, the historical root causes are:
+
+1. **Playwright binary loss** — `postDataBuffer()` drops multipart binary content. Don't use route forwarding; use curl.
+2. **Missing client-side callback** — Curl upload returned HTTP 200 but D365 stored 0-byte file size metadata. Workaround: `route.fulfill()` with the curl's fileId so D365's JS finalizes file size. *In practice, fresh BSID makes this unnecessary.*
+3. **Stale BSID** — `ms-dyn-bsid` changes on every `page.goto()`. Stale BSID = D365 accepts upload (200 + fileId) but stores 0 bytes. Always re-capture before uploading.
+4. **`setInputFiles()` crash** — Don't call `setInputFiles()` directly on the file input; use the Browse button → file chooser flow.
+5. **Cookie filtering** (May 2026) — Including cookies from `.crm.dynamics.com` or other dynamics.com subdomains causes HTTP 302 redirect to login. Filter to `operations.dynamics.com` cookies only.
 
 ## Recalling Submitted Reports
 
@@ -520,66 +620,17 @@ To clean up test uploads from the Receipts tab:
 5. Wait for processing (may show "Please wait" overlay)
 6. Verify the Receipts count returns to 0
 
-## OData API Status
+## OData / JSON Service API Status
 
-D365 Finance & Operations exposes OData entities for expense management, but they may not be accessible depending on your organization's security configuration.
+> **TL;DR**: Both APIs exist, but require admin-granted security roles that aren't enabled by default in most tenants. Until that changes, Playwright + curl on `/filemanagement` is the only working programmatic upload path.
 
-### JSON Service API (Bearer Token — NOT CURRENTLY USABLE)
+D365 F&O exposes:
+- **OData entities** at `/data/*` — `Expenses`, `TrvReceipts`, `UploadReceipts`, `ExpenseCategories`, etc. Most return 403 without `TrvExpTransEntity` read/write privileges.
+- **JSON service API** at `/api/services` — discoverable with bearer token (e.g. `ExpenseReceiptService.UploadReceipt`, `ExpenseReportsService.CreateExpenseReport`, `ecpAutomateExpenseReportService.CreateExpenseReport`), but operations return 401 without Service Operation entry point privileges.
 
-D365 also exposes a rich JSON service API at `/api/services` that accepts Entra ID bearer tokens for **discovery** but returns **401** when calling operations. These APIs are well-designed (especially the Copilot-specific ones) but require D365 Service Operation security privileges that are not granted by default.
+Bearer token from `az account get-access-token --resource https://<tenant>expense.operations.dynamics.com` works for discovery (`GET /api/services`), but is rejected by `/filemanagement` (which only accepts cookie auth).
 
-**How to get a bearer token:**
-```bash
-az account get-access-token --resource https://myexpense.operations.dynamics.com --query accessToken -o tsv
-```
-
-**Discovery works** (HTTP 200):
-- `GET /api/services` — lists 81 service groups
-- `GET /api/services/{group}/{service}/{operation}` — shows parameter names and types
-
-**Key service operations found** (all return 401 when called):
-
-| Service | Operation | Parameters |
-|---------|-----------|------------|
-| `ExpenseReceiptService.UploadReceipt` | Upload receipt as base64 | legalEntity, fileName, capturedReceipt (base64), contentType, fileExtension |
-| `ExpenseReceiptService.GetReceiptContent` | Download receipt | docuRefId (Int64) |
-| `ExpenseReceiptService.AttachReceiptToExpenseLine` | Attach receipt to expense | (unknown — not yet explored) |
-| `ExpenseReportsService.CreateExpenseReport` | Create report | (complex contract) |
-| `ExpenseReportsService.SubmitExpenseReportsToWorkflow` | Submit for approval | (complex contract) |
-| `ExpenseLinesService.CreateExpenseLine` | Add expense line | (complex contract) |
-| `ecpAutomateExpenseReportService.CreateExpenseReport` | Copilot automation | request (ecpExpAutomateCreateReportRequestContract[]) |
-
-**To enable**: A D365 admin must grant Service Operation entry point privileges for these operations to the user or a service principal. Once enabled, the entire expense workflow could be done via curl + bearer token with **no Playwright needed**.
-
-### OData Entities (Also NOT CURRENTLY USABLE)
-
-### Entities That Exist (Found in `$metadata`)
-
-| Entity | Purpose |
-|--------|---------|
-| `Expenses` | Main expenses |
-| `TrvReceipts` | Travel receipts |
-| `UploadReceipts` | Receipt uploads |
-| `ExpenseCategories` | Available categories |
-| `ecpTrvExps` | Expense transactions |
-| `ecpTrvInterimApprovers` | Interim approvers |
-| `MobileExpensesV2` | Mobile expense API |
-
-### Why They Return 403
-
-The OData API requires specific D365 security roles (e.g., read access to `TrvExpTransEntity`) that are separate from UI access. Error: *"User is not authorized to read view TrvExpTransEntity. Request denied."*
-
-**To enable**: A D365 admin must assign the user the appropriate data entity security roles (e.g., `TrvExpenseTransEntity` read/write privileges).
-
-### Bearer Token vs Cookie Auth
-
-| Endpoint | Bearer Token (`az account get-access-token`) | Cookie Auth (Playwright) |
-|----------|----------------------------------------------|--------------------------|
-| `/data/*` (OData) | 403 (security role needed) | N/A |
-| `/filemanagement` (uploads) | Returns login page (rejected) | ✅ Works |
-| D365 UI pages | N/A | ✅ Works |
-
-**Bottom line**: Until OData security roles are granted, Playwright + curl is the only working upload method. The bearer token approach (`az account get-access-token --resource https://myexpense.operations.dynamics.com`) gets a valid token, but the endpoints either require OData roles or don't accept bearer auth.
+If your tenant has these privileges granted, the entire expense workflow could be done via curl + bearer token without Playwright. Worth checking with your D365 admin if you're going to do this regularly.
 
 ## Submitting the Report
 
@@ -595,11 +646,13 @@ The OData API requires specific D365 security roles (e.g., read access to `TrvEx
 | Issue | Workaround |
 |-------|-----------|
 | Email attachment download fails | URL-encode the message ID (`/`→`%2F`, `+`→`%2B`, `=`→`%3D`) — see m365-mcp-tools skill |
-| File uploads lose binary content via route interception | Playwright's `postDataBuffer()` drops multipart file content. **Fix: capture form fields via route interception, then upload the actual file via `curl` from bash.** See [Programmatic Receipt Upload](#programmatic-receipt-upload) section. |
+| File uploads lose binary content via route interception | Use three-phase upload: intercept form fields → curl binary upload → route.fulfill() with fileId. See [Programmatic Receipt Upload](#programmatic-receipt-upload-three-phase-intercept--curl--fulfill) section. |
+| Curl upload returns 200 but file is 0-byte | **BSID is stale**. The `ms-dyn-bsid` changes on every `page.goto()`. Re-capture tokens from the current session before uploading. |
+| `setInputFiles()` crashes D365 page | **Never use `setInputFiles()`** on D365 upload forms. Always use Browse → file chooser → `browser_file_upload`. |
 | Cannot download uploaded receipt for verification | **Fixed**: Intercept `window.open()` URL from the Open button, then `curl` with a cookie-only config (no `url` line). Enables full MD5 hash comparison. See [Download Verification](#download-verification-md5-hash-comparison). |
 | OData API returns 403 | D365 OData entities exist but require security roles not granted by default. See [OData API Status](#odata-api-status). |
 | Bearer token rejected by `/filemanagement` | This endpoint only accepts cookie-based auth. Must use Playwright to obtain cookies. |
-| "Failed to upload" warning banner after two-phase upload | This is from the aborted Playwright upload, not the curl upload. Ignore it — verify receipt in the Receipts tab. Clears on page refresh. |
+| "Failed to upload" warning banner after three-phase upload | This is from the **aborted** Playwright upload in Step 2, not the curl upload. Ignore it — the fulfill in Step 4 tells D365's JS the upload succeeded. Verify receipt in the Receipts tab. Clears on page refresh. |
 | Grid row CSS IDs are unstable | Use `aria-label` selectors, not CSS IDs |
 | Virtualized grids render few rows | Scroll with `mouse.wheel()` via `browser_run_code` |
 | Em-dash in category names | Filter by partial name + select from dropdown |
