@@ -47,7 +47,7 @@ To change company: click the company button → combobox "Current company" appea
 Either:
 - Click **"Expense management"** button on the Dashboard, OR
 - Use nav menu: Workspaces → Expense management, OR
-- Direct URL: `https://myexpense.operations.dynamics.com/?cmp=XXXX&mi=ExpenseWorkspace`
+- Direct URL: `https://<tenant>expense.operations.dynamics.com/?cmp=XXXX&mi=ExpenseWorkspace`
 
 ## Discovering Expense Categories
 
@@ -182,6 +182,29 @@ Each expense in the report needs a Country/region value:
 4. Click **Save and continue** to advance to the next expense
 
 **Note**: Setting Country/region may trigger tax calculations (e.g., GST for AUS) — amounts in the grid may change to show tax-exclusive values.
+
+> **Bulk edit limitation**: The Bulk edit dialog (select multiple rows → Bulk edit) does **not** support Country/region. It only edits Category, Additional information, Financial dimensions, CC, and IO. For Country/region, you must set per-row by clicking each expense and using the detail panel + Save and continue.
+
+## Working with Lookups (approvers, categories, country, etc.)
+
+D365 lookup comboboxes have a few quirks worth knowing:
+
+**Slow population** — After typing a search term, the dropdown grid takes 2-3 seconds to populate (sometimes longer on first load). Use `await page.waitForTimeout(2500)` after typing before reading or clicking results. If the grid shows "First 50 ... displayed. Please Search for approver" and your match isn't visible, just wait — it often appears after a moment.
+
+**Unicode / accented characters** — Names like "Angèle", "Sébastien", "Müller" need `pressSequentially` rather than `fill()`. Plain `fill()` sets the value without firing the input events that trigger the lookup, so the dropdown won't filter:
+
+```javascript
+const fa = page.getByRole('combobox', { name: 'Final approver' });
+await fa.click();
+await fa.click({ clickCount: 3 });        // select all
+await page.keyboard.press('Delete');       // clear
+await fa.pressSequentially('Angèle', { delay: 80 });  // triggers events, supports Unicode
+await page.waitForTimeout(2500);            // let lookup populate
+await page.getByRole('row', { name: /Angèle Griffin/ }).click();
+await page.getByRole('button', { name: 'Select', exact: true }).click();
+```
+
+**Different reports may have different approver pools** — A user authorized as final approver for one expense report may not appear in the lookup for another (D365 filters by category/legal-entity). If a known-good approver doesn't appear, double-check the report context before assuming the user isn't authorized.
 
 ## How to Attach Receipts
 
@@ -575,11 +598,14 @@ To modify a submitted report (e.g., to change approvers or add expenses), you mu
 1. Go to the **Reports** tab in the Expense Management workspace
 2. Click the report row to select it
 3. Click the **Recall** button in the toolbar
-4. A comment dialog appears — enter a reason (e.g., "Updating interim approvers")
-5. Click **Confirm** / **OK**
-6. Report status changes from "In review" back to "Draft"
+4. A workflow dialog appears — click **Recall** to confirm
+5. Report status changes from "In review" back to "Draft"
 
-**Note**: All approvers lose their assignment when a report is recalled. You'll need to resubmit after making changes.
+**Note**: All approvers lose their assignment when a report is recalled. You'll need to resubmit after making changes (e.g., changing the final approver, adding a comment, or modifying expenses).
+
+> **Opening a recalled report**: Single-clicking the row only *selects* it; you need to either (a) double-click the report number cell, or (b) the page may auto-navigate to the report after recall — check the page title (`Expense report` vs `Expense management`) before assuming you're on the report detail page.
+
+> **Approver lookup may show different results after recall** — D365's approver pool is sometimes scoped per-submission. If a known-good approver doesn't appear post-recall, that's not a permission issue; just type the name and let the lookup populate (see [Working with Lookups](#working-with-lookups-approvers-categories-country-etc)).
 
 ## Managing Interim Approvers
 
