@@ -6,7 +6,7 @@ license: MIT
 
 # Dynamics 365 Expense Management
 
-This skill drives the D365 F&O Expense Management web UI via Playwright. The base URL pattern is `https://<tenant>expense.operations.dynamics.com` (Microsoft tenants use `myexpense`, others use their own subdomain). Most of this guidance is tenant-agnostic; tenant-specific items (like the receipt-by-email address) are called out where they appear.
+This skill drives the D365 F&O Expense Management web UI via Playwright. The base URL is org-specific: for **Microsoft it is `https://myexpense.operations.dynamics.com`** (company 1074 = MICROSOFT PTY LIMITED). The general form is `https://<subdomain>.operations.dynamics.com`, where `<subdomain>` is your org's F&O expense host — Microsoft's is `myexpense`; do **not** append an extra `expense` suffix. Most of this guidance is tenant-agnostic; tenant-specific items (like the receipt-by-email address) are called out where they appear.
 
 ## Getting Started
 
@@ -15,14 +15,14 @@ This skill drives the D365 F&O Expense Management web UI via Playwright. The bas
 Ask the user for their D365 expense URL if you don't already know it (or check their browser bookmarks / past sessions). Then:
 
 ```
-browser_navigate → https://<tenant>expense.operations.dynamics.com
+browser_navigate → https://myexpense.operations.dynamics.com   # Microsoft; general form: https://<subdomain>.operations.dynamics.com
 ```
 
 The system auto-redirects to `?cmp=XXXX&mi=DefaultDashboard` using the logged-in user's default company. No need to hardcode company codes.
 
 ### 💡 Shortcut: Email receipts directly
 
-D365 supports forwarding receipts by email — they auto-arrive on the user's Receipts tab without any upload work. **Look for an info banner on the workspace** that gives the org-specific address (e.g. `ExpenseReceipts@<tenant>.com` for Microsoft, or similar for other tenants).
+D365 supports forwarding receipts by email — they auto-arrive on the user's Receipts tab without any upload work. **Look for an info banner on the workspace** that gives the org-specific address (for Microsoft it is `ExpenseReceipts@Microsoft.com`; other tenants differ). The sender must be the user's authenticated work mailbox.
 
 When this banner is present, **suggest this path first** before doing any programmatic upload:
 
@@ -47,7 +47,7 @@ To change company: click the company button → combobox "Current company" appea
 Either:
 - Click **"Expense management"** button on the Dashboard, OR
 - Use nav menu: Workspaces → Expense management, OR
-- Direct URL: `https://<tenant>expense.operations.dynamics.com/?cmp=XXXX&mi=ExpenseWorkspace`
+- Direct URL: `https://<subdomain>.operations.dynamics.com/?cmp=XXXX&mi=ExpenseWorkspace` (Microsoft: `myexpense`)
 
 ## Discovering Expense Categories
 
@@ -86,8 +86,10 @@ async (page) => {
   for (const exp of expenses) {
     const catInput = page.locator('input[aria-label="Category"]');
     await catInput.click();
-    await catInput.fill(exp.category);
-    await page.waitForTimeout(500);
+    // Use pressSequentially, not fill(): Category is a lookup, and fill() doesn't fire the
+    // input events that filter the dropdown (see "Working with Lookups").
+    await catInput.pressSequentially(exp.category, { delay: 50 });
+    await page.waitForTimeout(800);
     await page.keyboard.press('ArrowDown');
     await page.keyboard.press('Enter');
     await page.waitForTimeout(300);
@@ -247,7 +249,7 @@ Three things to get right (in priority order):
 
 1. **Fresh BSID** — `ms-dyn-bsid` (Browser Session ID) changes on every `page.goto()`. Capture tokens from the *current* page session immediately before uploading. Stale BSID = HTTP 200 returned but file stored as 0 bytes (silent corruption).
 2. **Cookie filtered to operations.dynamics.com only** — Including cookies from other dynamics.com subdomains (e.g. `CrmOwinAuth` from `.crm.dynamics.com`) causes HTTP 302 redirect to login. Only `ms-dyn-affinity`, `backend-affinity`, `DynamicsOwinAuth`, `ms-dyn-csrftoken`, `DynamicsOwinAuthC1`, `DynamicsOwinAuthC2` should be sent.
-3. **Browse → file chooser → `browser_file_upload`** — Never use `page.locator('input[type="file"]').setInputFiles()` directly; it crashes the D365 page.
+3. **Browse → handle the `filechooser` event** — click Browse, then set the file via the chooser: `fc.setFiles()` inside `browser_run_code`, or the `browser_file_upload` MCP tool (equivalent). Never use `page.locator('input[type="file"]').setInputFiles()` directly; it crashes the D365 page.
 
 #### Step 1: Open the upload dialog and select the file
 
@@ -348,7 +350,7 @@ with open('/tmp/d365_download.conf', 'w') as f:
 curl -s -o /tmp/upload_response.txt -w "%{http_code}" \
   -K /tmp/d365_upload.conf \
   -X POST \
-  "https://<tenant>expense.operations.dynamics.com/filemanagement" \
+  "https://<subdomain>.operations.dynamics.com/filemanagement" \
   -F "clientId=${CLIENT_ID}" \
   -F "maxChunkSize=1024000" \
   -F "tableid=${TABLE_ID}" \
@@ -427,7 +429,7 @@ async (page) => {
 
 ```bash
 curl -s -o /tmp/verified.pdf -K /tmp/d365_download.conf \
-  "https://<tenant>expense.operations.dynamics.com/<captured_url>"
+  "https://<subdomain>.operations.dynamics.com/<captured_url>"
 md5sum /path/to/original.pdf /tmp/verified.pdf
 ```
 
@@ -469,7 +471,10 @@ Then click **Attach to expense** → in the dialog, click the `addButtonImagePro
 ```javascript
 await page.getByRole('button', { name: ' Attach to expense' }).click();
 await page.waitForTimeout(2000);
-await page.getByRole('row', { name: /addButtonImageProvider 3\/12\// }).getByLabel('addButtonImageProvider').click();
+// Match the row for the SPECIFIC expense by its date or amount — never "first available".
+const target = '3/12/2026';  // <-- the target expense's date (or use its amount, e.g. '$890.89')
+const rowRe = new RegExp('addButtonImageProvider .*' + target.replace(/[.$()]/g, '\\$&'));
+await page.getByRole('row', { name: rowRe }).getByLabel('addButtonImageProvider').click();
 await page.waitForTimeout(2500);
 await page.keyboard.press('Escape');  // close the dialog
 ```
@@ -654,7 +659,7 @@ D365 F&O exposes:
 - **OData entities** at `/data/*` — `Expenses`, `TrvReceipts`, `UploadReceipts`, `ExpenseCategories`, etc. Most return 403 without `TrvExpTransEntity` read/write privileges.
 - **JSON service API** at `/api/services` — discoverable with bearer token (e.g. `ExpenseReceiptService.UploadReceipt`, `ExpenseReportsService.CreateExpenseReport`, `ecpAutomateExpenseReportService.CreateExpenseReport`), but operations return 401 without Service Operation entry point privileges.
 
-Bearer token from `az account get-access-token --resource https://<tenant>expense.operations.dynamics.com` works for discovery (`GET /api/services`), but is rejected by `/filemanagement` (which only accepts cookie auth).
+Bearer token from `az account get-access-token --resource https://<subdomain>.operations.dynamics.com` works for discovery (`GET /api/services`), but is rejected by `/filemanagement` (which only accepts cookie auth).
 
 If your tenant has these privileges granted, the entire expense workflow could be done via curl + bearer token without Playwright. Worth checking with your D365 admin if you're going to do this regularly.
 
@@ -672,13 +677,13 @@ If your tenant has these privileges granted, the entire expense workflow could b
 | Issue | Workaround |
 |-------|-----------|
 | Email attachment download fails | URL-encode the message ID (`/`→`%2F`, `+`→`%2B`, `=`→`%3D`) — see m365-mcp-tools skill |
-| File uploads lose binary content via route interception | Use three-phase upload: intercept form fields → curl binary upload → route.fulfill() with fileId. See [Programmatic Receipt Upload](#programmatic-receipt-upload-three-phase-intercept--curl--fulfill) section. |
+| File uploads lose binary content via route interception | Capture fresh tokens, then upload the binary with curl on `/filemanagement` — don't forward the request through a Playwright route (it drops the multipart binary). `route.fulfill()` is only a fallback for the 0-byte case. See [Programmatic Receipt Upload](#programmatic-receipt-upload). |
 | Curl upload returns 200 but file is 0-byte | **BSID is stale**. The `ms-dyn-bsid` changes on every `page.goto()`. Re-capture tokens from the current session before uploading. |
-| `setInputFiles()` crashes D365 page | **Never use `setInputFiles()`** on D365 upload forms. Always use Browse → file chooser → `browser_file_upload`. |
-| Cannot download uploaded receipt for verification | **Fixed**: Intercept `window.open()` URL from the Open button, then `curl` with a cookie-only config (no `url` line). Enables full MD5 hash comparison. See [Download Verification](#download-verification-md5-hash-comparison). |
-| OData API returns 403 | D365 OData entities exist but require security roles not granted by default. See [OData API Status](#odata-api-status). |
+| `setInputFiles()` crashes D365 page | **Never use `setInputFiles()`** on D365 upload forms. Always go Browse → `filechooser` event → `fc.setFiles()` (or the `browser_file_upload` MCP tool). |
+| Cannot download uploaded receipt for verification | **Fixed**: Intercept `window.open()` URL from the Open button, then `curl` with a cookie-only config (no `url` line). Enables full MD5 hash comparison. See [Optional: Verify upload integrity (MD5)](#optional-verify-upload-integrity-md5). |
+| OData API returns 403 | D365 OData entities exist but require security roles not granted by default. See [OData / JSON Service API Status](#odata--json-service-api-status). |
 | Bearer token rejected by `/filemanagement` | This endpoint only accepts cookie-based auth. Must use Playwright to obtain cookies. |
-| "Failed to upload" warning banner after three-phase upload | This is from the **aborted** Playwright upload in Step 2, not the curl upload. Ignore it — the fulfill in Step 4 tells D365's JS the upload succeeded. Verify receipt in the Receipts tab. Clears on page refresh. |
+| "Failed to upload" warning banner after the curl upload | This is from the **aborted** Playwright upload (the `route.abort()` in the token-capture step), not the curl upload. Ignore it — verify the receipt in the Receipts tab; it clears on page refresh. |
 | Grid row CSS IDs are unstable | Use `aria-label` selectors, not CSS IDs |
 | Virtualized grids render few rows | Scroll with `mouse.wheel()` via `browser_run_code` |
 | Em-dash in category names | Filter by partial name + select from dropdown |
