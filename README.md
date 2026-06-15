@@ -109,6 +109,8 @@ This skill works best when paired with the following MCP servers and tools. Thes
 | **python3** | Base64 decode email attachments, write curl config files (avoids shell cookie truncation) |
 | **convert** (ImageMagick) | Convert scanned receipt PDFs to PNG for visual reading |
 
+> When running under GitHub Copilot CLI, it's fine to use its built-in MCP file tools (`view`/`create`/`edit`) in place of `bash`/`python3` for reading and writing the **text** files (curl config, token JSON). Use `bash`/`python3` for binary work like base64-decoding an attachment into a PDF.
+
 ### Setup
 
 For M365 MCP server setup, see [skill-m365-mcp-tools](https://github.com/danielp370-msft/skill-m365-mcp-tools). A typical `~/.copilot/mcp-config.json` includes:

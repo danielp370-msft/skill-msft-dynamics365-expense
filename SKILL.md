@@ -210,6 +210,8 @@ await page.getByRole('button', { name: 'Select', exact: true }).click();
 
 ## How to Attach Receipts
 
+> **Copilot CLI file tools:** The steps below use `bash`/`python3` to read and write local files for portability across agents. When running under GitHub Copilot CLI, it's perfectly fine to use its built-in MCP file tools instead — `view` to read, and `create`/`edit` to write the **text** files (e.g. the curl config and the `__capturedUpload` token JSON). Keep `bash`/`python3` for binary work such as decoding a base64 attachment into a PDF, since the file tools handle text rather than raw binary.
+
 ### Retrieving Receipts from Email
 
 > Outlook mail access comes from the **OutlookMail** server (M365 MailTools), which can **search, read, and reply** to mail. For expenses you only need it to locate a receipt attachment; for setup, the full tool list, the message-ID encoding gotcha, and auth/token refresh, see the **m365-mcp-tools** skill.
