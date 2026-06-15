@@ -212,10 +212,12 @@ await page.getByRole('button', { name: 'Select', exact: true }).click();
 
 ### Retrieving Receipts from Email
 
+> Outlook mail access comes from the **OutlookMail** server (M365 MailTools), which can **search, read, and reply** to mail. For expenses you only need it to locate a receipt attachment; for setup, the full tool list, the message-ID encoding gotcha, and auth/token refresh, see the **m365-mcp-tools** skill.
+
 If the user says the receipt is in their email, use `MailTools-SearchMessages` to find it:
 
 ```
-MailTools-SearchMessages: "receipt from [restaurant name]" or "jotnot receipt [name]"
+MailTools-SearchMessages: "receipt from <merchant>" or "receipt <month> <amount>"
 ```
 
 The search returns message IDs and metadata. To download the attachment:
@@ -498,7 +500,7 @@ await page.keyboard.press('Escape');  // close the dialog
 
 ### Reading Receipt Content (Scanned PDFs)
 
-Many receipts are scanned images (e.g., JotNot) — `pdftotext` won't extract anything useful. To read the amount, date, and merchant from an image-based receipt PDF:
+Many receipts are scanned images (e.g., from a scanner app or a phone photo) — `pdftotext` won't extract anything useful. To read the amount, date, and merchant from an image-based receipt PDF:
 
 1. **Convert PDF to PNG** using ImageMagick (available on this system):
    ```bash
